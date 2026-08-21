@@ -38,6 +38,12 @@ GET connectionreferences?$select=connectionreferencelogicalname,connectionid,_cr
 
 **Practical rule:** don't depend on writing a file into a OneDrive you don't own. Host templates/scratch in SharePoint (writable by a licensed user via Graph) or in the OneDrive of the identity you're actually logged in as.
 
+## Creating a flow: the caller must own the connections
+
+**A NEW flow validates its connections against the identity making the call.** Creating or activating a flow whose connection references belong to another account fails, even with admin rights. Log in as the connections' owner for `create`/`activate`; PATCHing `clientdata` and toggling state on an **existing** flow works as any account with write access.
+
+Corollary worth knowing before planning a "human step": a connector already used by another flow in the environment has a **bound connection reference** you can reuse in a new flow purely via `clientdata` — no solution import, no manual bind. Only a connector with no connection reference in the environment needs the import + consent path.
+
 ## Connection references & binding
 
 - The flow's `connectionReferences` map a logical connector (`shared_wordonlinebusiness`, `shared_onedriveforbusiness`, `shared_office365`, `shared_commondataserviceforapps`, `shared_sharepointonline`, …) to a connection.
@@ -55,3 +61,8 @@ GET connectionreferences?$select=connectionreferencelogicalname,connectionid,_cr
 | `404 Item not found` on `/me/drive` | The signed-in account has no provisioned OneDrive. |
 | `unsupportedWorkbook` / `FileCorruptTryRepair` | Excel Workbook API can't open the file (e.g. header-only table). |
 | `406 cannotOpenFile` on PDF convert | Often a Word doc with duplicate `w:id` (repeating section). |
+| `0x80060468` "Required property 'schemaVersion' not found" | POSTing a new `workflows` record whose `clientdata` lacks root `"schemaVersion":"1.0.0.0"`. |
+| Create/activate of a NEW flow fails on connections | You are not the identity that owns them. Log in as the owner. |
+| `TriggerInputSchemaMismatch` on any body | The trigger is `kind: Button` / PowerApps V2 — not invocable via the Flow API. Temporary `kind:Http` swap (deploy-and-test.md §4b). |
+| Word Populate: "not a PNG or JPG" | A picture param passed as a JSON **string** instead of an object `{$content-type,$content}` — typically flattened by a maker-UI save. |
+| Word desktop: "unreadable content" on the generated docx | Normal for Populate output (absolute rel Targets). Deliver the PDF. |

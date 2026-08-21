@@ -19,7 +19,7 @@ Region host for Flow API: e.g. crm4 = `https://emea.api.flow.microsoft.com`. The
 
 ## 1. Pull the live definition (source of truth)
 
-Local solution `.json` files drift. Always read the deployed `clientdata`:
+Local solution `.json` files drift. Always read the deployed `clientdata` — **every time, as the first step, even mid-session and even if a snapshot from ten minutes ago is on disk**. The only exception is an explicit user instruction to work from a named file. A maker-UI save between two of your runs rewrites the definition (dynamic schema stripped, image params flattened to strings), so patching a stale copy silently reverts someone else's fix.
 
 ```python
 # GET workflows(<WF>)?$select=clientdata,statecode,modifiedon  (Dataverse)
@@ -73,7 +73,42 @@ GET {flowhost}/.../flows/{WF}/runs/{run}/actions?api-version=2016-11-01     # ac
 
 Each action has `properties.outputsLink.uri` — a **SAS URL (no Authorization header)**. GET it to read the action's output JSON; for file-producing actions (Word Populate, OneDrive Convert) the `body` is the file (often `{"$content-type":..., "$content": "<base64>"}`). Decode and inspect the real bytes.
 
-Status meaning: `Skipped` on a branch action = the `If`/condition went the other way (NORMAL), not an error. Only `Failed`/`Faulted`/`TimedOut` are failures; follow their `outputsLink` for the raw connector error body.
+Status meaning: `Skipped` on a branch action = the `If`/condition went the other way (NORMAL), not an error. A `Delay` inside an `Until` loop is `Skipped` on the iteration that exits — also normal. Only `Failed`/`Faulted`/`TimedOut` are failures; follow their `outputsLink` for the raw connector error body.
+
+**`inputsLink` is what the run actually SENT.** The definition contains `@{...}` expressions; the run's inputs contain the resolved values. To verify an email really went to the right address with a valid attachment, download `properties.inputsLink.uri` of the send action and check `To`, `Subject`, body HTML and the attachment's `$content` (decode it: a PDF must start with `%PDF`, not `JVBERi0x`). Never claim "the mail is right" from the definition.
+
+**Action counts don't match the designer.** `/runs/{id}/actions` enumerates actions nested inside `If_*` / `Scope_*` / `Until_*` too, so it reports more than the top-level count you see when editing. Compare like with like before concluding something was added or lost.
+
+## 4b. Triggers you cannot invoke from the CLI (Button / PowerApps V2)
+
+A **manual** trigger of `kind: Button` or a **PowerApps V2** trigger cannot be started through the Flow API: every body shape returns `TriggerInputSchemaMismatch`.
+
+**Workaround — temporary trigger swap, always restored:**
+
+```python
+live = pull()                                        # live clientdata (source of truth)
+orig = json.dumps(live["properties"]["definition"]["triggers"], ensure_ascii=False)
+try:
+    live["properties"]["definition"]["triggers"] = {"manual": {"type": "Request",
+        "kind": "Http", "inputs": {"schema": {"type": "object",
+        "properties": {"text": {"type": "string"}}}}}}
+    patch_clientdata(live)                           # off -> patch -> on (+ stop/start)
+    cb = flow("POST", f"flows/{WF}/triggers/manual/listCallbackUrl?api-version=2016-11-01")
+    url = cb.get("response", {}).get("value") or cb.get("value")     # <- see below
+    post_json(url, {"text": record_id})
+finally:
+    live["properties"]["definition"]["triggers"] = json.loads(orig)
+    patch_clientdata(live)
+    back = pull()
+    assert json.dumps(back["properties"]["definition"]["triggers"], ensure_ascii=False) == orig, \
+        "trigger NOT restored — check it by hand"
+```
+
+Two details that cost time:
+- `listCallbackUrl` answers `{"response": {"value": "<url>", ...}, "httpStatusCode": 200}` — the URL is in **`response.value`**, not `value`.
+- The restore must be in a `finally` **and verified**: leaving a production flow on an HTTP trigger means anyone with the URL can run it. Print the comparison result; don't assume.
+
+Prefer this over "just click Run in the portal" only when you need it scripted/repeatable — a portal run is free and leaves the definition untouched.
 
 ## 5. Testing harness pattern (seed → run → verify → cleanup)
 
@@ -110,3 +145,23 @@ Setting a Dataverse **image or file column** in the create POST fails: `0x800904
 | 7 | Added or Modified or Deleted |
 
 Changing it is a definition edit → deploy + re-register (section 3). Prefer a superset (e.g. 4) for temporary test widening so create still works even if you forget to revert.
+
+## 8. Dataverse trigger semantics you will trip over
+
+- **`message` is not a bitmask.** It's the `callbackregistration.message` optionset (table above). `3` is *Modified only* — a flow set to `3` never fires on create. Use `4` for create+update.
+- **`filteringattributes` reacts to a column being PRESENT in the payload**, not to its value changing. PATCHing a record with the *same* value still fires the flow. That's the cheap **backfill** trick: re-PATCH every relevant record with its current values to make a recalculation flow run over the existing data.
+- A wider `filteringattributes` set is harmless if the flow recomputes from scratch; it just fires more often.
+- **There is no pre-image.** The trigger body has the new values only. So if a lookup is moved or cleared, the flow cannot fix up the *previous* parent record — it will keep stale data. Say this out loud as a known limit instead of pretending the flow is symmetric; the alternatives are a Delete/Change trigger or a scheduled reconcile.
+- Scope matters: `Organization` vs `User` decides whether the flow sees records owned by others.
+
+## 9. Dates: DateOnly UserLocal is a trap
+
+Dataverse date behaviours differ per column and the flow must match them:
+
+| Column behaviour | What to do |
+|---|---|
+| **DateOnly / UserLocal** (stored as local midnight in UTC, e.g. `2026-07-27T22:00:00Z` = 28 July in Rome) | **Pass it through raw** to another UserLocal column. Formatting it (`formatDateTime(...,'yyyy-MM-dd')`) reads the UTC instant and **loses a day** for records created east of UTC. |
+| **TimeZoneIndependent** | Already the intended calendar date; format directly. |
+| Any date you must **render** into a document (dd/MM/yyyy, split into boxes) | `convertFromUtc(<value>, 'W. Europe Standard Time')` first, then format. |
+
+Symptom of getting it wrong: a document or a synced field showing the day *before* the one the user typed, only for some records. Check the column's behaviour before "fixing" the expression.
